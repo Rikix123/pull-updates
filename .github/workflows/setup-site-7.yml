@@ -1,0 +1,67 @@
+name: Build and publish Windows setup for 7.0.0
+on:
+  push:
+    branches: [release/setup-site-7.0.0]
+permissions:
+  contents: write
+jobs:
+  installer:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Fetch and verify released application
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download v7.0.0 --pattern Pull-Browser-7.0.0-win-x64.zip
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $zip = Get-Item Pull-Browser-7.0.0-win-x64.zip
+          if ((Get-FileHash $zip).Hash -ne 'a1c84ab1d8b866fc89f32e3dc719a5a8f8d689900b8cb4dfc3e36df45ff28919') { throw 'Unexpected archive' }
+          [IO.Compression.ZipFile]::ExtractToDirectory($zip.FullName,(Join-Path $PWD 'installer/payload'))
+      - name: Build full offline setup
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (!(Test-Path $iscc)) {
+            choco install innosetup --version=6.4.3 --yes --no-progress
+            if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          }
+          & $iscc installer/setup.iss
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Test clean install, reinstall, and uninstall
+        run: |
+          $setup = (Get-Item installer/dist/Pull-Browser-Setup-7.0.0.exe).FullName
+          $dest = Join-Path $env:RUNNER_TEMP PullSetupTest
+          $argsList = @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',('/DIR="' + $dest + '"'))
+          foreach ($attempt in 1..2) {
+            $p = Start-Process $setup -ArgumentList $argsList -Wait -PassThru
+            if ($p.ExitCode) { throw "Install failed: $($p.ExitCode)" }
+          }
+          $payload = (Resolve-Path installer/payload).Path
+          $files = @(Get-ChildItem $payload -Recurse -File)
+          foreach ($file in $files) {
+            $installed = Join-Path $dest ([IO.Path]::GetRelativePath($payload,$file.FullName))
+            if ((Get-FileHash $file.FullName).Hash -ne (Get-FileHash -LiteralPath $installed).Hash) { throw "File mismatch: $installed" }
+          }
+          $uninstall = Get-ChildItem $dest -Filter unins*.exe | Select-Object -First 1
+          $p = Start-Process $uninstall.FullName -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+          if ($p.ExitCode -or (Test-Path (Join-Path $dest 'Pull.WebView2.exe'))) { throw 'Uninstall failed' }
+          Write-Host "Verified $($files.Count) installed files."
+      - name: Attach tested setup
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload v7.0.0 installer/dist/Pull-Browser-Setup-7.0.0.exe
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $a = (gh release view v7.0.0 --json assets | ConvertFrom-Json).assets | Where-Object name -eq 'Pull-Browser-Setup-7.0.0.exe'
+          if ($a.digest -ne ('sha256:' + (Get-FileHash installer/dist/Pull-Browser-Setup-7.0.0.exe).Hash.ToLowerInvariant())) { throw 'Published installer digest mismatch' }
+      - name: Verify live Cloudflare download links
+        run: |
+          npm install --no-save --ignore-scripts playwright-core@1.55.0
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          node installer/site-check.cjs
